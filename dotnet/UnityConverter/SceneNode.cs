@@ -1,0 +1,128 @@
+namespace GameEngine.UnityConverter;
+
+// File IDs stay strings: Unity's serialized IDs can exceed double precision.
+internal sealed record UnityObjectReference(string Guid, string? FileId, bool Embedded = false, string? SerializedVersion = null);
+
+internal sealed class LightInfo
+{
+    public required string Type; // "directional" | "point"
+    public double[] Color = [1, 1, 1];
+    public double Intensity = 1;
+    public double Range = 10;
+    public bool Shadows;
+    public bool Enabled;
+}
+
+/// One scene-graph node — port of convert.js makeNode()/cloneNode(). The
+/// `Father` field carries the same three states the JS uses: null =
+/// unresolved (pre-pass-6) or root (post-pass-6), "ROOT" = transient
+/// sentinel, otherwise a node id.
+internal sealed class SceneNode
+{
+    public string Id = "";
+    public string Name = "";
+    public bool Active = true;
+    public double[] Pos = [0, 0, 0];
+    public double[] Rot = [0, 0, 0, 1];
+    public double[] Scale = [1, 1, 1];
+    public string FatherAnchor = "0";
+    public string? Father;
+    public List<string> Children = [];
+    public UnityObjectReference? MeshRef;
+    public string? MeshPrimitive;
+    public double MatCount = 1;
+    public List<UnityObjectReference?> MaterialRefs = [];
+    public IReadOnlyList<string?> MatGuids => MaterialRefs.Select(r => r is { Embedded: false } ? r.Guid : null).ToArray();
+    public bool CastShadows = true;
+    public bool ReceiveShadows = true;
+    public bool RendererEnabled = true;
+    public bool Skinned;
+    public bool NonStaticFbx;
+    public LightInfo? Light;
+    public double? UrpShadowTier;
+    public double Order;
+
+    public static SceneNode Make(string? name)
+    {
+        return new SceneNode { Id = "n" + (++G.NodeCounter), Name = name ?? "" };
+    }
+
+    public SceneNode Clone()
+    {
+        var c = new SceneNode
+        {
+            Id = "n" + (++G.NodeCounter),
+            Name = Name,
+            Active = Active,
+            Pos = [.. Pos],
+            Rot = [.. Rot],
+            Scale = [.. Scale],
+            FatherAnchor = FatherAnchor,
+            Father = Father,
+            Children = [],
+            MeshRef = MeshRef,
+            MeshPrimitive = MeshPrimitive,
+            MatCount = MatCount,
+            MaterialRefs = [.. MaterialRefs],
+            CastShadows = CastShadows,
+            ReceiveShadows = ReceiveShadows,
+            RendererEnabled = RendererEnabled,
+            Skinned = Skinned,
+            NonStaticFbx = NonStaticFbx,
+            Light = Light,
+            UrpShadowTier = UrpShadowTier,
+            Order = Order,
+        };
+        return c;
+    }
+
+    // Full scoped references own the slots; the GUID-only view is derived.
+    public void SetMaterialReference(int idx, UnityObjectReference? reference)
+    {
+        while (MaterialRefs.Count <= idx) MaterialRefs.Add(null);
+        MaterialRefs[idx] = reference;
+    }
+
+    public string? GetMatGuid(int idx) => idx >= 0 && idx < MaterialRefs.Count && MaterialRefs[idx] is { Embedded: false } reference ? reference.Guid : null;
+}
+
+/// Parsed file structure — nodes in insertion order plus anchor aliases.
+internal sealed class FileStructure
+{
+    public bool IsFbx;
+    public string SourceGuid = "";
+    public Dictionary<string, UnityYamlDoc> Documents = [];
+    public List<LodSourceGroup> LodGroups = [];
+    public Dictionary<string, LodSourceGroup> AnchorToLodGroup = [];
+    public List<string> UnsupportedStructuralOperations = [];
+    public readonly List<string> NodeOrder = [];
+    public readonly Dictionary<string, SceneNode> NodesById = [];
+    public readonly Dictionary<string, string> AnchorToNode = [];
+    public readonly Dictionary<string, string> AnchorTypes = [];
+    public readonly List<string> RootIds = [];
+    public Dictionary<string, InstanceClone>? InstanceClones;
+
+    public SceneNode Get(string id) => NodesById[id];
+    public SceneNode? TryGet(string? id) => id != null && NodesById.TryGetValue(id, out SceneNode? n) ? n : null;
+    public int Count => NodeOrder.Count;
+
+    public void Add(SceneNode node)
+    {
+        NodeOrder.Add(node.Id);
+        NodesById[node.Id] = node;
+    }
+
+    public IEnumerable<SceneNode> Nodes()
+    {
+        foreach (string id in NodeOrder) yield return NodesById[id];
+    }
+}
+
+internal sealed class InstanceClone
+{
+    public required string SourceGuid;
+    public required FileStructure Sub;
+    public required Dictionary<string, string> Map; // sub node id -> clone id
+    public required Dictionary<LodSourceGroup, LodSourceGroup> GroupClones;
+    public required string RootCloneId;
+}

@@ -1,0 +1,557 @@
+# OpenEngine Unity Scene Converter
+
+Converts a Unity scene (from an extracted `.unitypackage`, e.g. Synty packs)
+into an OpenEngine/GameEngine text `.scene` file. Scope: **static mesh
+placements + materials (`.mat` → `.material`) + lights (directional/point) +
+scene environment (fog/ambient → day-night classification, physical light
+units, faithful DDS-cubemap skybox → equirect HDRI)**, with optional URP
+pipeline/post-processing state (colour grading, bloom, vignette, chromatic
+aberration, SSAO) pulled from a real Unity project.
+
+Zero runtime dependencies — Node.js stdlib only.
+
+## Install
+
+```
+npm install -g github:Lunarsong/OpenEngine-Unity-Scene-Converter
+```
+
+or from a clone:
+
+```
+git clone https://github.com/Lunarsong/OpenEngine-Unity-Scene-Converter.git
+cd OpenEngine-Unity-Scene-Converter
+npm link        # puts unity-scene-convert / unity-scene-validate on PATH
+```
+
+Requires Node.js >= 22.
+
+## Static mesh library API
+
+Asset recipes can use the shared decoder and encoder directly from the package
+entry point without running a scene conversion:
+
+```js
+const { readUnityMesh, encodeUnityMeshGlb } = require('openengine-unity-scene-converter');
+const mesh = readUnityMesh(unityMeshYaml, '4300000'); // exact fileID string
+const glb = encodeUnityMeshGlb(mesh, { materialNames: ['Roof', 'Timber'] });
+```
+
+`readUnityMesh(text, fileID = '4300000')` accepts the supported single-document,
+uncompressed static Mesh v10 layout and returns owned typed arrays in source
+coordinates. `encodeUnityMeshGlb(mesh, { materialNames } = {})` returns a GLB
+Buffer using the converter's existing coordinate, winding, UV and tangent
+conventions. Invalid or unsupported input throws; these functions do not write
+files or start the CLI.
+
+`materialNames` is optional: omitted, `undefined` or `null` retains the exact
+default output bytes and `UnityMaterial_<slot>` names. Otherwise it must be an
+array with one nonempty string per source submesh, in source order. Names are
+preserved verbatim, including whitespace and duplicates; they label material
+domains and do not resolve materials, merge slots or alter geometry. The managed
+equivalent is `UnityStaticMesh.EncodeGlb(mesh, IReadOnlyList<string>? materialNames = null)`.
+Its default bytes and named output match JavaScript.
+
+## CLI usage
+
+```
+unity-scene-convert [<pkg-dir> [<project-dir>]] \
+                    [--pkg <extracted-pkg-dir | pack.unitypackage>] \
+                    [--scene <scene path suffix | unity guid>] [--scene <...>] \
+                    [--project <target-project-dir>] \
+                    [--assetdb <file>] [--unity-project <unity-project-dir>] \
+                    [--out <output.scene>] [--local-shadows off|faithful] \
+                    [--no-copy-textures] [--png] [--texc <TextureCompiler.exe>] \
+                    [--grade-lut] [--json] [--verbose]
+unity-scene-convert --list-scenes <extracted-pkg-dir | pack.unitypackage>
+```
+
+- The first positional argument maps to `--pkg`, the second to `--project`
+  (explicit flags win). When `--scene` is omitted and the package contains
+  exactly one `.unity` scene, it is auto-picked.
+- `--pkg` — directory produced by `tar -xzf pack.unitypackage` (entries are
+  `<guid>/pathname` + `<guid>/asset`), or the raw `.unitypackage` itself
+  (extracted to a temp dir automatically; very large packs — beyond ~4 GB
+  extracted — must be pre-extracted). Archive entry names are untrusted: an
+  entry whose destination resolves outside the extraction directory aborts the
+  run with `unitypackage entry escapes extraction dir` rather than being
+  written or quietly clamped.
+- `--scene` — e.g. `scenes/demo.unity` (case-insensitive path suffix) or the
+  asset guid. Repeatable: each `--scene` converts one scene in the same run,
+  with shared materials/textures emitted once and each `.scene` output
+  byte-identical to a standalone single-scene run (`--out` is single-scene
+  only; multi-scene runs use the default `<Scene>_unity.scene` naming).
+- `--list-scenes` — inventory mode: print one JSON object (`scenes` with
+  name/path/guid, `assetCounts` by type, `totalAssets`) and exit without
+  converting.
+- `--json` — machine-readable stdout for editor/tool integration: JSON lines
+  `{"phase","step","total","detail"}` during the run (`total: null` for
+  unbounded item streams like texture encodes), then one final
+  `{"phase":"summary", ok, scenes:[...], materials, outputs:[{path,kind}]}`
+  object carrying per-scene counts, the honest-drop report, and every file
+  the conversion wrote. Human diagnostics stay on stderr.
+- `--project` — target engine project dir. Uses
+  `<project>/AssetDatabase.assetdb` for mesh resolution (override with
+  `--assetdb`) and defaults output to `<project>/assets/<Scene>_unity.scene`.
+- `--unity-project` — optional path to a REAL Unity project dir (containing
+  `ProjectSettings/` + `Assets/`). A `.unitypackage` never ships URP pipeline
+  assets or quality settings; this flag resolves the active render pipeline
+  asset (QualitySettings current level, GraphicsSettings fallback) and pulls
+  in what the pack can't: the RP asset's quality-level volume profile
+  (layered UNDER the scene's global volume, URP-style), the renderer's SSAO
+  feature (→ `AmbientOcclusionEffect`), and shadow/HDR/MSAA facts (logged).
+- `--grade-lut` — legacy colour-grade path: bake `ShadowsMidtonesHighlights`
+  to a Resolve-style `.cube` LUT in `<project>/assets/` plus `CubeLutEffect`
+  lines (the authored `lutAsset` path is asset-root-relative,
+  `<Scene>_smh_lut.cube`, which is what the engine's SceneIO resolves it
+  against on load). Without the flag, SMH/LGG wheels map to the engine's
+  native `ColorGradeEffect` three-way bands — see
+  [Colour grading](#colour-grading). Kept for one release of A/B comparison.
+- `--local-shadows` — additional-light (point/spot) shadow policy, see
+  [Limitations](#limitations-all-counted-in-stats).
+- `--no-copy-textures` / `--png` / `--texc` — texture handling, see
+  [Textures](#textures).
+
+FBX references resolve against the target project first — by **filename
+stem, case-insensitive** (Unity
+`SM_Env_Tree_03.fbx` → any assetdb `Model` entry whose file stem is
+`sm_env_tree_03`). Ambiguous stems pick the shortest path and warn. Stems the
+project lacks are **seeded automatically**: the pack's FBX is extracted into
+`Models_Unity/` and referenced by path, resolving once the project registers
+it. A `; UNRESOLVED ...` comment (no MeshRenderer) remains only when the pack
+itself carries no source for the mesh.
+
+Example (a Synty demo pack):
+
+```
+unity-scene-convert ./elvenrealm-pkg ./polygon-lod-project --scene scenes/demo.unity
+```
+
+### Validation
+
+```
+unity-scene-validate <output.scene> <source.unity>
+```
+
+Structural checks per the engine's SceneIO rules (unique ids, parents defined
+before use, tuple shapes, quaternion norm, well-formed asset refs) plus a
+cross-check of uniquely-named prefab instances against the Unity source
+(position/rotation/scale within tolerance). Exits non-zero on any error.
+
+## Programmatic usage
+
+The package is CommonJS; the CLI entry and the material-mapping/transform
+primitives are exported:
+
+```js
+const conv = require('openengine-unity-scene-converter');
+
+// Full conversion (same behavior as the CLI):
+conv.main([process.execPath, 'convert', '--pkg', pkgDir, '--scene', 'demo.unity',
+           '--project', projectDir]);
+
+// Transform-convention primitives (see below):
+conv.conj(q); conv.qMul(a, b); conv.qRotate(q, v);
+conv.emitObjectQuat(qUnity);        // what gets written for an object rotation
+conv.emitDirectionalQuat(worldRot); // what gets written for a directional light
+conv.composeWorldTRS(chain);        // parent-chain TRS composition
+conv.TRANSFORM_CONVENTION_VERSION;  // 'lh-v4 (R(q) engine, lights +Z)'
+
+// Ambient colour space (see Environment):
+conv.srgbToLinear(x); conv.linearizeAmbientColor(rgb);
+conv.emitAmbientLightLines(renderSettings, verbose);
+
+// Material mapping (unit-testable without running a conversion):
+conv.parseUnityMat(text); conv.classifyMaterial(ctx, info);
+conv.buildMaterialDoc(ctx, info, name);
+conv.buildTriplanarDoc(ctx, info, name);
+conv.buildWaterDoc(ctx, info, name); conv.buildFallsDoc(ctx, info, name);
+```
+
+## Conventions the converter guarantees
+
+These are locked by golden regression tests (`npm test`); a stale or forked
+copy that regresses any of them fails loudly.
+
+### Quaternion convention (lh-v4)
+
+Both engines are left-handed, Y-up, Z+ forward. Engine `FromTRS` is LH:
+`matrix * v == q.Rotate(v)`. Lights shine along entity **+Z** (same as Unity).
+The converter emits Unity quaternions **as-is** for objects and directionals.
+Every run prints a `transform-convention: lh-v4 (R(q) engine, lights +Z)`
+banner to stderr.
+
+Scenes written by conj-v2 stored `conj(q_unity)` to cancel the old inverse
+`FromTRS`. Those files must be re-imported after this convention; the
+workaround lived in the stored bytes.
+
+The guard tests cover: object rotations (identity emit to 6 dp), hand-derived
+directional-light emit goldens, parented composition round-trips (with a
+negative control for the conjugated bug class), negative-scale (mirror)
+preservation, and an end-to-end CLI run over a synthetic fixture.
+
+### Coordinate mapping
+
+Identity pass-through: both engines are left-handed, Y-up, Z+ forward,
+quaternions serialized `(x, y, z, w)`. No unit conversion (Synty pack FBX
+metas are uniformly `useFileScale: 1, globalScale: 1`, so both Unity and the
+engine's ufbx-based importer honor the FBX file's own units). Hierarchy is
+emitted with `[entity id parent]` + LOCAL `Transform` values, mirroring
+Unity's local TRS 1:1. Negative scale (mirroring) is preserved verbatim.
+
+### Light units
+
+The engine uses physical light units (directional lights in Lux, punctual
+lights in Candela) with sky/exposure anchored around a ~100k-lux sun. Unity
+URP with physical units OFF (every Synty pack) authors dimensionless
+intensities, so the converter anchors Unity intensity 1.0 to a per-scene
+reference illuminance:
+
+- **Day** scenes: ~100,000 lux/unit (full daylight).
+- **Night** scenes (fog on + dim ambient sky): ~2,000 lux/unit (stylized
+  moonlight) — night moonlight is authored ~1.5 dimensionless, which at the
+  daylight scale would render as a blown-out day.
+- **Emission**: `1.0` is scene-linear paperwhite = **203 nits** (the shared
+  anchor for material `emissionLuminance` and the water shaders' emission
+  scale).
+- **Ambient**: night scenes emit an `AmbientLight` floor (~60 nits) matched
+  in-engine against the Unity reference; a day-latent guard skips it for day
+  scenes, where it would be imperceptible.
+
+## What it does
+
+- Parses Unity YAML (`src/unityyaml.js`, stdlib-only; fileIDs kept as strings
+  — they exceed 2^53) for the scene and every referenced `.prefab`,
+  recursively.
+- Expands `PrefabInstance` docs by cloning the source prefab's node tree and
+  applying `m_Modification.m_Modifications` (TRS / name / active / renderer
+  flags). Synty "variant" prefabs that wrap an FBX model prefab become a
+  single mesh node.
+- Mod targets that are Unity hash-computed fileIDs (nested prefab internals)
+  are discriminated via the scene's *stripped* docs: the single unresolvable
+  class-4 `m_CorrespondingSourceObject` fileID per instance is the instance
+  root transform's computed id, so root TRS mods land exactly; other unknown
+  targets are dropped and counted (`dropped deep ...` stats).
+- Unity builtin meshes map to engine primitives (Cube/Sphere/Capsule/Plane).
+
+### Materials
+
+Unity FBX-embedded materials carry dead source-texture paths, so the real
+shipped textures + cutout/blend flags + tints + emission are read from the
+`.mat` files. The converter parses them and emits engine `StandardPBR`
+`.material` assets under `<project>/assets/Materials_Unity`, bound per-submesh
+via `MeshRenderer.material`.
+
+- Material slots come from the renderer's `m_Materials` (real MeshRenderers)
+  or the variant-prefab's `m_Materials.Array.data[k]` instance overrides.
+  Submesh `<base>_k` binds material slot `k`.
+- Synty shader property names are read empirically (any shader family):
+  `_Albedo_Map`/`_Base_Map`/`_MainTex` → `albedoMap`, `_Normal_Map`/`_Normals`
+  → `normalMap`, `_Emission_Map` → `emissiveMap`. `_ALPHATEST_ON` + `_Cutoff`
+  → `Mask` + `alphaCutoff`; `_SURFACE_TYPE_TRANSPARENT`/`_Surface`/alpha<1 →
+  `Blend`; `_Cull 0` → doubleSided; emission (map or HDR color) →
+  `emissive` + `emissionLuminance` (nits, 203 = scene-linear 1.0).
+- Water families: Synty's Waterfall FLOW/FALLS shader graphs map to bundled
+  project-side surface shaders (see [Surface shaders](#surface-shaders)) with
+  the graph constants decoded (panner speeds and their FBX V-flip sign
+  correction, fresnel rim cap semantics, premultiplied falls blend).
+- Un-mappable custom shaders are counted and left at the FBX default (never
+  smeared with wrong guesses); every unique `.mat` is reported per shader
+  family in the stats.
+
+### Textures
+
+Textures resolve Unity-guid → pack pathname stem → project assetdb (exact
+then normalized-alnum stem, since Unity's importer collapses separators:
+`Wood_Floor_Boards` → `WoodFloorBoards`). Textures the project never imported
+(normal/emissive maps, alt swatches) are **copied** into
+`<project>/assets/Textures_Unity` and referenced by path
+(`--no-copy-textures` to disable). By default copied textures are encoded to
+UASTC KTX2 (block-compressed, pre-mipped) via the engine's
+`TextureCompiler.exe` — located via `--texc`, the `GE_TEXC` env var, or
+engine build trees under the current working directory; `--png` (or no
+encoder found) falls back to raw image copies.
+
+Encoding is per SLOT, not per image: colour slots encode `--srgb` into
+`<stem>.ktx2`, mask/metallic-roughness/AO slots `--linear` into
+`<stem>_linear.ktx2`, normal slots `--normal-map` into `<stem>_normal.ktx2`,
+so one image bound as two kinds yields two containers. Existing containers are
+reused rather than re-encoded, and a failed encode degrades to the raw copy
+instead of dropping the texture. Guarded by `tests/texc-staging.test.mjs`,
+which stands in a deterministic encoder (output = a pure function of source
+bytes + flag) so the whole lane is covered without the native tool.
+
+### Environment
+
+Parses the scene's `RenderSettings` (fog color/mode/range, ambient sky/
+equator/ground, skybox). Classifies day vs night (fog on + dim ambient) and
+maps lights/ambient/sky trim accordingly (see
+[Light units](#light-units)).
+
+Ambient: Unity's Flat (`m_AmbientMode` 3) and Trilight/Gradient (mode 1)
+ambient map to the engine's additive `AmbientLight` irradiance floor
+(night-anchored at 60 nits), with an sRGB→linear decode — Unity's
+`m_Ambient*Color` RenderSettings fields serialize the colour **picker's**
+sRGB-encoded floats, not linear light (guarded by
+`tests/ambient-linearization.test.mjs`). Skybox-mode ambient (mode 0) emits
+nothing: that ambient IS the sky IBL.
+
+Directional lights: every enabled directional is emitted enabled; the engine
+lights the strongest 4 (luma × intensity) with cascaded shadows from the
+primary only. The converter anchors `SkyEnvironment.SunLight` to the same
+strongest directional the engine picks, so anchor and shading primary coincide
+by construction; scenes with more than 4 enabled directionals get a stderr
+note.
+
+**Gaps (honest):** fog values are parsed but only Unity *linear* distance fog
+is emitted (as `HeightFogEffect` distance term); the sun-direction sky region
+can blow out under auto-exposure.
+
+### Faithful skybox
+
+`RenderSettings.m_SkyboxMaterial` pointing at the builtin **Skybox/Cubemap**
+shader (fileID 103) over a DDS cubemap converts to the engine's real sky: the
+cubemap is resampled to an equirect Radiance `.hdr` in `Textures_Unity/`
+(D3D face lookup, bilinear in linear space, width `min(8192, 4*faceSize)`),
+and the scene gains a `Skybox` entity that outranks `SkyEnvironment` and
+drives dome + IBL. Unity's dome multiplier `tint × colorspace-double ×
+exposure` is baked per channel into the `.hdr`; a `.bake.json` sidecar skips
+the (slow) resample on re-runs when source and parameters are unchanged. The
+emitted `SkyEnvironment` stays as the sun link and fail-visible fallback
+(missing HDRI → procedural sky, never a black dome). Other skybox shader
+families (6-sided/procedural/panoramic) fall back to the mood translation and
+warn. Guarded by `tests/sky-pipeline.test.mjs`.
+
+### Colour grading
+
+Unity volume grades map to the engine's native `ColorGradeEffect`, a unified
+three-way corrector graded in ACEScct-shaped log space
+(`ColorGradeEffect.gradeInLog = true`):
+
+- **ShadowsMidtonesHighlights** — URP's wheel prep (verbatim
+  `ColorUtils.PrepareShadowsMidtonesHighlights`) yields per-channel linear
+  multipliers; a multiply by *k* becomes a log-domain band offset
+  `log2(k)/17.52/0.5`, split into master lightness (channel mean) + chroma
+  (zero-mean remainder). All-neutral wheels are a bit-exact no-op.
+- **LiftGammaGain** — via ASC CDL: Gain→Highlights is an exact multiply;
+  Lift→Shadows and Gamma→Midtones are linearised to their
+  mid-grey-referenced multiplier. Composes additively (log domain) with SMH
+  when both are authored.
+- **ColorAdjustments** — saturation carries 1:1; contrast carries the FULL
+  URP percentage (`1 + pct/100`) since both grade in log around ACEScc
+  mid-grey; hue shift carries 1:1 in degrees (an HSV rotation at the tail of
+  the chain in both). `colorFilter` becomes a `ColorFilterEffect` multiply on
+  pre-tonemap HDR colour — URP applies `.value.linear`, so the picker channels
+  carry through sRGB→linear, and the component's multiply/intensity-1 defaults
+  reproduce URP's plain multiply.
+- **WhiteBalance** — `temperature`/`tint` carry verbatim in URP's `-100..100`
+  range; the engine mirrors `ColorUtils.ColorBalanceToLMSCoeffs` (CAT02 LMS
+  von Kries gains) and applies them at the head of the grade chain, in linear,
+  exactly as URP does.
+- **ChromaticAberration** — Unity's normalized `[0,1]` intensity maps onto
+  the engine's absolute pixel range (`[0,12]` px, linear).
+- **ColorLookup** — the user's 2D strip LUT texture is transcoded to a
+  Resolve-style `.cube` at convert time (exact texel carry; PNG 8/16-bit
+  truecolor, non-interlaced) and emitted as a `CubeLutEffect` with
+  `inputEncoding = Rec709SRGB` — URP samples the user LUT over sRGB-encoded
+  display colour (core `Color.hlsl ApplyColorGrading`), which is exactly the
+  engine's Rec709SRGB wrap — and `intensity = contribution`. Strip layout:
+  size = height, blue tiles along x, red within a tile, green along v (GPU
+  v=0 = the PNG's bottom row). Inert configs (contribution 0 / no texture —
+  URP's `IsActive` gate) skip silently; non-PNG formats, non-strip
+  dimensions, or a texture missing from the package are honest drops.
+  Guarded by `tests/user-lut-transcode.test.mjs`.
+
+Anything else the user authored in a volume (SplitToning, ChannelMixer,
+ColorCurves, Bloom tint, …) is recorded and
+printed unconditionally in a **"recognized settings dropped"** summary at the
+end of every conversion — silently dropping authored intent is the
+converter's worst failure mode. Guarded by `tests/color-grade-mapping.test.mjs`
+and `tests/volume-drop-reporting.test.mjs`.
+
+## Surface shaders
+
+Two project-side GLSL surface shaders ship with the package under `shaders/`
+(`water_stylized.glsl`, `waterfall_fx.glsl`). When a converted material needs
+one, it is copied next to the generated materials
+(`<project>/assets/Materials_Unity/`) so `surfaceShader: "<name>.glsl"`
+resolves material-dir-local. They land in your project as editable content —
+you own the copies and can extend them.
+
+Re-running a conversion refreshes those copies safely via hash comparison:
+
+- destination matches the bundled version → left alone (up to date);
+- destination matches a **known previously-shipped version** (manifest:
+  `shaders/shipped-hashes.json`) → auto-overwritten with the current version;
+- destination was **edited by you** (hash unknown) → warn-and-skip, your
+  edits are never clobbered (delete the file to re-copy).
+
+Hashes are SHA-256 over LF-normalized content, so CRLF checkouts don't
+misclassify a pristine copy as user-edited. The manifest is seeded with every
+version ever shipped from the engine repo, so projects converted before this
+package existed refresh correctly too.
+
+## Prefab mesh references and static Unity Mesh assets
+
+MeshFilter references retain both the source GUID and the exact string fileID
+through prefab expansion. `m_Mesh` replacements are applied as object references,
+including an explicit null that removes the inherited mesh. Stripped renderers
+and MeshFilters are indexed alongside transforms. For nested components without
+an explicit stripped document, the legacy XOR instance namespace is admitted
+only when the instance's serialized aliases confirm it; foreign source GUIDs
+cannot authenticate an alias. Unresolved mesh replacement targets or missing
+replacement assets fail explicitly instead of rendering the old FBX.
+
+The Node and C# converters support **one uncompressed static Mesh-v10 document**
+per `.asset`: a single float32 stream with positions, normals, tangents and UV0,
+and triangle submeshes with 16- or 32-bit indices. Other versions, layouts,
+compressed/external data, skinning and blend shapes fail with a diagnostic.
+Conversion needs `--project` and writes a standard GLB under
+`Models_Unity/SerializedMeshes/<source-guid>/<fileID>.glb`. This is authoring code;
+the engine's existing glTF importer owns runtime loading. No Python dependency is
+added. A re-run writes the same bytes for unchanged source data.
+
+Each original submesh becomes a uniquely named mesh node and keeps its original
+material domain. Renderer material-array length never truncates the geometry.
+GLB X reflection and reversed triangle winding pair with the engine's default
+Mirror X import; V is flipped and tangent handedness is adjusted consistently.
+All-NaN source tangent vectors alone receive a stable perpendicular basis, with
+the repaired vertex indices reported; other non-finite data is rejected.
+
+This does **not** establish general FBX-to-Unity material-slot parity. Serialized
+Mesh submesh order is explicit; native FBX indices may differ from Unity renderer
+slots. Missing inherited renderer defaults cannot be reconstructed from an
+isolated Mesh asset: those GLB domains retain placeholders and are reported as
+`mesh.defaultMaterials`. Unresolved material targets are also reported. A full
+material-fidelity import still needs verified source slot mapping and shader
+adaptation; do not assume that an FBX connection or polygon-first-use order is a
+universal Unity slot-order contract.
+
+Regression coverage includes repeated nested instances, explicit aliases under
+other ID schemes, null and missing references, malformed static buffers,
+material-domain preservation and independent triangle/UV tangent-frame checks.
+All fixtures are synthetic; no licensed asset data is distributed.
+
+## Limitations (all counted in stats)
+
+- Skinned meshes, characters (non-`SM_*` FBX), cameras, particles, colliders,
+  MonoBehaviours, terrain: skipped. Lights: directional + point converted;
+  spot/area skipped.
+- Additional-light (point/spot) shadows: `--local-shadows` picks the policy.
+  `faithful` (default) emits the source light's shadow flag plus a
+  `Light.shadowResolutionTier` (engine 1/2/3 = Low/Medium/High) mapped from
+  the light's URP `UniversalAdditionalLightData` tier. `off` restores a
+  blanket suppression for scenes whose source pipeline never rendered local
+  shadows (raw asset packs without an RP asset — one flagged light can
+  otherwise cost ~10 ms CPU/frame as a dedicated 6× 2048² cube pass). The
+  directional sun's shadow flag passes through unchanged in both modes.
+- Multi-submesh FBX split into `<base>_0..N-1` sibling entities (one per
+  material slot), each binding its own `.material`.
+- Deep overrides inside multi-node prefab instances whose targets have no
+  stripped doc (`dropped deep TRS/prop overrides`): the node keeps its
+  prefab-default value. `m_IsActive=0` drops are reported separately since
+  they would leave meshes visible that Unity hides.
+- LODGroups: ordered Unity source records are retained in the library structure and JSON report; engine renderer-group selection is unsupported. Embedded mesh/material members are reported and omitted, and unapplied group overrides are explicit. See [LOD source records](docs/LodSourceRecords.md).
+- Counters for prefab-*internal* skipped content (e.g. lights inside a
+  prefab) count once per unique prefab, not per instance.
+
+## Known geometry mirror (engine-side, not the converter)
+
+Engine-imported FBX geometry is Z-mirrored vs Unity: the engine's FBX loader
+bakes `diag(-1,1,-1)` (negate X *and* Z) for a +Z-front RH source, where Unity
+bakes negate-X only — so chiral/asymmetric props face mirror-wrong while
+symmetric buildings look fine. Transforms are clean (verbatim Unity
+positions/rotations round-trip exactly). The fix is loader-side and
+engine-wide; the converter deliberately emits **no compensation** (which would
+double-apply once the loader is fixed).
+
+## Engine scene format reference
+
+See the engine's `Engine/Source/Scene/SceneIO.cpp` (parser) and
+`Engine/Source/Scene/BuiltInSceneSchemas.cpp` (component property names).
+Emitted subset:
+
+```
+[scene name="Demo" version=1]
+[entity id="e_1" parent="e_0"]
+Name.value = "SM_Env_Tree_03 (77)"
+Transform.position = (98.54, -87.256, 15.582)
+Transform.rotation = (0, 0, 0, 1)          ; quaternion x,y,z,w
+Transform.scale = (0.91237, 1.1877, 0.91237)
+MeshRenderer.meshAsset = [path="fbx/environment/sm_env_tree_03.fbx" guid="bdd66329-..."]
+MeshRenderer.renderLayerMask = 1
+MeshRenderer.castShadows = true
+MeshRenderer.receiveShadows = true
+```
+
+## C# converter (`dotnet/`)
+
+`dotnet/UnityConverter/` is a byte-parity C# port of the JS converter plus the
+Unity `.shadergraph` importer (reader, node mapping, SG v2 emitter, custom
+functions as `@sgnode` GLSL). It doubles as a standalone CLI
+(`dotnet run --project dotnet/UnityConverter -- <args>`, same argument surface
+as `unity-scene-convert`) and as the engine editor's in-process import-modal
+converter, hosted on the editor's CoreCLR runtime. Its bundled surface shaders
+are embedded from this repo's `shaders/` dir — the same files the JS converter
+stages — so both converters ship byte-identical copies.
+
+```
+dotnet build dotnet/UnityConverter                # CLI + editor-hosted assembly
+dotnet test  dotnet/UnityConverter.Tests         # shader-graph converter tests
+```
+
+One test, `NodeMap_EveryMappedPinExistsOnTheEngineSignature`, audits the node
+mapping table against the engine's live node GLSL signatures; it needs an
+engine checkout and is skipped in a standalone clone of this repo. Point
+`OPENENGINE_ENGINE_ROOT` at a GameEngine checkout to run it here; inside the
+engine tree it always runs.
+
+## Development
+
+```
+npm test    # golden guard tests (transform convention, ambient colour space,
+            # sky pipeline, colour grading, drop reporting, shader refresh)
+```
+
+Tests build synthetic Unity fixtures at runtime — the repository contains no
+Unity Editor content, no licensed asset-pack content, and no values recorded
+from licensed scenes (all numeric goldens are synthesized and hand-derived);
+contributions must keep it that way.
+
+**Repository relationship:** this repo is the single authoring source for all
+converter code: the JS converter and the C# converter/shader-graph importer.
+The engine does not carry a copy of the sources.
+
+## Using the converter from the engine
+
+The engine's editor runs the C# converter in-process from its `unity-import`
+engine package (Tools > Import Unity Package...). The engine repository
+vendors one built assembly, `EnginePackages/unity-import/Tools/UnityConverter.dll`,
+and records the converter commit it was built from, the build command and the
+file's SHA-256 beside it in `UnityConverter.dll.source`.
+
+The assembly references only the .NET 9 base libraries (no engine assemblies),
+so it does not need rebuilding when the engine changes; it needs rebuilding
+only when the converter changes. To update the engine's copy:
+
+1. Land the change here.
+2. Build the assembly from a clean checkout of that commit:
+
+   ```
+   npm run build:dll
+   ```
+
+   This runs `dotnet build dotnet/UnityConverter/UnityConverter.csproj -c Release
+   -p:ContinuousIntegrationBuild=true -p:DebugType=none -o dist` (.NET 9 SDK).
+   `ContinuousIntegrationBuild` normalizes source paths and `DebugType=none`
+   drops the PDB, so the same commit builds the same bytes in any checkout
+   location; the assembly's informational version carries the commit it was
+   built from. The bundled shaders in `shaders/` are embedded in the assembly
+   as resources.
+3. Copy `dist/UnityConverter.dll` over the engine's
+   `EnginePackages/unity-import/Tools/UnityConverter.dll` and update the commit
+   and SHA-256 in `UnityConverter.dll.source`, in one engine pull request.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
