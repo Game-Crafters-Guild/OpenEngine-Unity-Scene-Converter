@@ -722,10 +722,6 @@ export function buildCorpus(root) {
                 { name: 'convert', args: ['--pkg', pkg, '--scene', 'GradeTest.unity', '--project', '<PROJ>', '--png'] },
             ]);
         }
-        // --grade-lut legacy path (writes the .cube).
-        F('grade-lut', { pkgDir: path.join(dir, 'smh', 'pkg') }, [
-            { name: 'lut', args: ['--pkg', path.join(dir, 'smh', 'pkg'), '--scene', 'GradeTest.unity', '--project', '<PROJ>', '--png', '--grade-lut'] },
-        ]);
     }
 
     // ---- 5. drop (volume-drop-reporting.test.mjs corpus) ----
@@ -760,6 +756,37 @@ export function buildCorpus(root) {
         ]);
     }
 
+    // ---- 5a. look (Tonemapping mode -> PostProcessVolume.look, drops reported) ----
+    {
+        const dir = path.join(root, 'look');
+        const tonemappingDoc = (mode) => ['  m_Name: Tonemapping', '  active: 1',
+            '  mode:', '    m_OverrideState: 1', `    m_Value: ${mode}`];
+        const variants = { aces: 2, custom: 3, external: 4 };
+        let n = 0;
+        for (const [variant, mode] of Object.entries(variants)) {
+            ++n;
+            const sceneGuid = `00000000000000000000000000lk0${n}01`;
+            const profGuid = `00000000000000000000000000lk0${n}02`;
+            const pkg = path.join(dir, variant, 'pkg');
+            writeExtractedDir(pkg, {
+                [sceneGuid]: {
+                    pathname: 'Assets/Scenes/LookTest.unity',
+                    asset: sceneYaml([
+                        lightYaml(300, 'Sun', 1),
+                        globalVolumeYaml(400, profGuid),
+                    ], kDayRenderSettings),
+                },
+                [profGuid]: {
+                    pathname: 'Assets/Volumes/LookProfile.asset',
+                    asset: profileYaml([tonemappingDoc(mode)]),
+                },
+            });
+            F(`look-${variant}`, { pkgDir: pkg }, [
+                { name: 'human', args: ['--pkg', pkg, '--scene', 'LookTest.unity', '--project', '<PROJ>', '--png'] },
+            ]);
+        }
+    }
+
     // ---- 5b. userlut (ColorLookup strip -> CubeLutEffect .cube transcode) ----
     {
         const dir = path.join(root, 'userlut');
@@ -777,7 +804,7 @@ export function buildCorpus(root) {
             tga: { docs: [lookupDoc(1)], lut: Buffer.from('TGA-BYTES-NOT-DECODED'), lutPath: 'Assets/LUTs/TealOrange.tga' },
             conflict: {
                 docs: [lookupDoc(0.8), smhDoc([1.2, 1, 0.9, 0], [1, 1, 1, 0], [0.9, 1, 1.1, 0])],
-                lut: lutStrip(16), lutPath: 'Assets/LUTs/TealOrange.png', extraArgs: ['--grade-lut'],
+                lut: lutStrip(16), lutPath: 'Assets/LUTs/TealOrange.png',
             },
             // Hostile decoder inputs — both twins must terminate (the runner's
             // spawn timeout turns a wedge into a FAIL) with identical drop notes.
